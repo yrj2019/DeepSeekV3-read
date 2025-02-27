@@ -7,14 +7,14 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from kernel import act_quant, weight_dequant, fp8_gemm
+# from kernel import act_quant, weight_dequant, fp8_gemm
 
 
 world_size = 1
 rank = 0
 block_size = 128
 gemm_impl: Literal["bf16", "fp8"] = "bf16"
-attn_impl: Literal["naive", "absorb"] = "absorb"
+attn_impl: Literal["naive", "absorb"] = "naive"
 
 @dataclass
 class ModelArgs:
@@ -148,6 +148,9 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
         - If `gemm_impl == "bf16"`, dequantization and a `bf16` GEMM operation are applied.
         - For other cases, the function applies quantization to `x` and uses `fp8_gemm` for computation.
     """
+    # 每个block都会有一个缩放参数
+    # x会被划分成x.shape[-1] // BLOCK_SIZE个block，因此scale.shape[-1] = x.shape[-1] // BLOCK_SIZE
+    # 计算的数据类型为bf16时，会编写算子weight_dequant
     if weight.element_size() > 1:
         return F.linear(x, weight, bias)
     elif gemm_impl == "bf16":
@@ -357,6 +360,9 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
         if min == max:
             max += 0.001
         linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
+        #      | min, if x_i < min
+        #y_i = | x_i, if min <= x_i <= max
+        #      | max, if x_i > max
         ramp_func = torch.clamp(linear_func, 0, 1)
         return ramp_func
 
@@ -385,7 +391,7 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     """
     dtype = x.dtype
     x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
+    freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1)) # [1, 16384, 1, 32]
     y = torch.view_as_real(x * freqs_cis).flatten(3)
     return y.to(dtype)
 
@@ -453,26 +459,44 @@ class MLA(nn.Module):
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
         """
+        # x [2, 128, 2048]
+        # bsz = 2, seqlen = 128, end_pos = 128
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
         if self.q_lora_rank == 0:
+            # q [2, 128, 3072]
             q = self.wq(x)
         else:
             q = self.wq_b(self.q_norm(self.wq_a(x)))
+        # q [2, 128, 16, 192]
         q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
+        # q_nope [2, 128, 16, 128]
+        # q_pe [2, 128, 16, 64]
+        # freqs_cis [128, 32]
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         q_pe = apply_rotary_emb(q_pe, freqs_cis)
+        # kv [2, 128, 576]
         kv = self.wkv_a(x)
+        # kv [2, 128, 512]
+        # k_pe [2, 128, 64]
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        # k_pe [2, 128, 1, 64]
         k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
         if attn_impl == "naive":
+            # q [2, 128, 16, 192]
             q = torch.cat([q_nope, q_pe], dim=-1)
+            # kv [2, 128, 4096]
             kv = self.wkv_b(self.kv_norm(kv))
+            # kv [2, 128, 16, 256]
             kv = kv.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+            # k_nope [2, 128, 16, 128]
+            # v [2, 128, 16, 128]
             k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            # k [2, 128, 16, 192]
             k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
             self.k_cache[:bsz, start_pos:end_pos] = k
             self.v_cache[:bsz, start_pos:end_pos] = v
+            # scores [2, 128, 16, 128]
             scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
         else:
             wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
@@ -486,6 +510,7 @@ class MLA(nn.Module):
             scores += mask.unsqueeze(1)
         scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
         if attn_impl == "naive":
+            # x [2, 128, 16, 128]
             x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
         else:
             x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
@@ -793,12 +818,33 @@ class Transformer(nn.Module):
             logits = torch.cat(all_logits, dim=-1)
         return logits
 
-
 if __name__ == "__main__":
     torch.set_default_dtype(torch.bfloat16)
-    torch.set_default_device("cuda")
-    torch.manual_seed(0)
+    torch.set_default_device("cpu")
+    layer_id = 0
     args = ModelArgs()
+    layer = Block(layer_id, args)
     x = torch.randint(0, args.vocab_size, (2, 128))
-    model = Transformer(args)
-    print(model(x).size())
+    embed = ParallelEmbedding(args.vocab_size, args.dim)
+    h = embed(x)
+    start_pos = 0
+    seqlen = x.size(1)
+    freqs_cis = precompute_freqs_cis(args)
+    freqs_cis = freqs_cis[start_pos: start_pos + seqlen]
+    mask = None
+
+    if seqlen > 1:
+        mask = torch.full((seqlen, seqlen), float("-inf"), device=x.device).triu_(1)
+    h = layer(h, start_pos, freqs_cis, mask)
+    # res = precompute_freqs_cis(ModelArgs)
+    # print("res", res)
+    # print("res shape", res.shape)
+    # mla = MLA(ModelArgs)
+# if __name__ == "__main__":
+#     torch.set_default_dtype(torch.bfloat16)
+#     torch.set_default_device("cuda")
+#     torch.manual_seed(0)
+#     args = ModelArgs()
+#     x = torch.randint(0, args.vocab_size, (2, 128))
+#     model = Transformer(args)
+#     print(model(x).size())
